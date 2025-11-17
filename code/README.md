@@ -11,8 +11,9 @@
     xpack.security.transport.ssl.enabled: false 확인
 - run_elasticsearch.sh 실행
 - rag_with_elasticsearch.py 실행
+2. 종료방법
 - stop_elasticsearch.sh를 통해 종료
 
-2. OpenAI API를 사용하기 위해서는 API 키가 필요
+3. OpenAI API를 사용하기 위해서는 API 키가 필요
 - .env.example 확인
 
