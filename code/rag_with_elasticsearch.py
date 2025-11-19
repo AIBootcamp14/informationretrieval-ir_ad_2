@@ -111,14 +111,14 @@ def hybrid_retrieve(query_str, size, alpha=0.5): # 하이브리드 함수
         if not hits:
             return
         # 점수 정규화
-        max_score = max(h["_score"] for h in hits) or 1.
+        max_score = max(h["_score"] for h in hits) or 1.0
         for h in hits:
             src = h.get("_source", {})
             docid = src.get("docid")
             if docid is None:
                 # docid 없으면 스킵
                 continue
-            norm_score = (h["_score"] / max_score) + weight
+            norm_score = (h["_score"] / max_score) * weight
             if docid not in combined:
                 combined[docid] = {
                     "_source": src,
@@ -440,4 +440,4 @@ def eval_rag(eval_filename, output_filename):
             idx += 1
 
 
-eval_rag("./data/eval.jsonl", "sample_submission_hybrid.csv")
+eval_rag("./data/eval.jsonl", "sample_submission_hybrid2.csv")
