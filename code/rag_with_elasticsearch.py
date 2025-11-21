@@ -7,6 +7,7 @@ from elasticsearch import Elasticsearch, helpers
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 from dotenv import load_dotenv
+import numpy as np  # [신규] dense 재랭킹을 위한 코사인 유사도 계산
 
 # -------------------------------
 # 1. .env 파일 불러오기
@@ -18,7 +19,7 @@ ES_USERNAME = os.getenv("ES_USERNAME")
 ES_PASSWORD = os.getenv("ES_PASSWORD")
 ES_CA_CERT = os.getenv("ES_CA_CERT")   # ex) ./http_ca.crt
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LLM_MODEL= "gpt-4o-mini" # gpt-4o-mini에서 변경
+LLM_MODEL = "gpt-4o-mini"  # gpt-4o-mini에서 변경
 
 # 환경변수 확인(디버깅용)
 print("[INFO] Loaded environment variables:")
@@ -51,8 +52,6 @@ def get_embeddings_in_batches(docs, batch_size=100):
 # -------------------------------
 # 3. Elasticsearch 연결 설정
 # -------------------------------
-# ES_CA_CERT는 절대경로 또는 상대경로 모두 허용됩니다.
-# 예: code/http_ca.crt 또는 C:/Users/.../http_ca.crt
 ES_HOST = os.getenv("ES_HOST", "http://localhost:9200")
 
 es = Elasticsearch(
@@ -84,6 +83,9 @@ def bulk_add(index, docs):
 # 4-1. sparse / dense 리트리버
 # -------------------------------
 def sparse_retrieve(query_str, size):
+    """
+    BM25 기반 sparse 검색 (nori analyzer 사용)
+    """
     query = {
         "match": {
             "content": {
@@ -96,6 +98,9 @@ def sparse_retrieve(query_str, size):
 
 
 def dense_retrieve(query_str, size):
+    """
+    dense_vector (embeddings) 기반 kNN 검색
+    """
     query_embedding = get_embedding([query_str])[0]
     knn = {
         "field": "embeddings",
@@ -106,10 +111,10 @@ def dense_retrieve(query_str, size):
     return es.search(index="test", knn=knn)
 
 
-def hybrid_retrieve(query_str, size, alpha=0.5): # 하이브리드 함수
+def hybrid_retrieve(query_str, size, alpha=0.5):
     """
-    sparse(BM25)와 dense(KNN) 결과를 가중 합으로 섞는 하이브리드 검색.
-    - alpha: sparse 가중치 (0~1). 0.5면 동등한 비중.
+    [기존 하이브리드] sparse(BM25)와 dense(KNN)를 점수 가중합으로 섞는 방식.
+    (현재 RAG 파이프라인에서는 사용하지 않지만, 참고용으로 남겨둠)
     """
     # 각각 검색
     sparse = sparse_retrieve(query_str, size)
@@ -155,54 +160,14 @@ def hybrid_retrieve(query_str, size, alpha=0.5): # 하이브리드 함수
     return {"hits": {"hits": merged_hits}}
 
 
-def rrf_fusion(result_list, k=60):
-    """
-    여러 검색 결과 리스트를 Reciprocal Rank Fusion(RRF)으로 합치는 유틸리티 함수.
-
-    Parameters
-    ----------
-    result_list : list[list[dict]]
-        Elasticsearch search().get("hits", {}).get("hits", []) 형태의 결과 리스트.
-        예: [sparse_hits, dense_hits]
-    k : int
-        RRF 상수. 일반적으로 10~60 사이 값을 사용.
-
-    Returns
-    -------
-    dict
-        {docid: {"_source": ..., "_score": rrf_score}} 형태의 딕셔너리
-    """
-    fused = {}
-
-    for hits in result_list:
-        if not hits:
-            continue
-
-        # 각 리트리버에서의 순위 (1위부터 시작)
-        for rank, h in enumerate(hits, start=1):
-            src = h.get("_source", {})
-            docid = src.get("docid")
-            if docid is None:
-                # docid 없는 문서는 스킵
-                continue
-
-            # RRF 점수: 1 / (k + rank)
-            score = 1.0 / (k + rank)
-
-            if docid not in fused:
-                fused[docid] = {
-                    "_source": src,
-                    "_score": 0.0,
-                }
-            fused[docid]["_score"] += score
-
-    return fused
-
-
-def hybrid_retrieve_rrf(query_str, size, k=60, per_retriever_k=None):
+# -------------------------------------------------------------------
+# [신규] RRF 제거 후: dense 200 + sparse 200 → docid 중복 제거 → dense 재랭킹
+# -------------------------------------------------------------------
+def hybrid_retrieve_dense_rerank(query_str, size, per_retriever_k=200):
     """
     BM25 기반 sparse 검색과 dense 벡터 검색 결과를
-    Reciprocal Rank Fusion(RRF)으로 합치는 하이브리드 검색 함수.
+    'dense 200개 + sparse 200개 → docid 기준 중복 제거 → dense 유사도 재랭킹'
+    전략으로 결합하는 함수.
 
     Parameters
     ----------
@@ -210,38 +175,59 @@ def hybrid_retrieve_rrf(query_str, size, k=60, per_retriever_k=None):
         검색 질의 문자열
     size : int
         최종으로 반환할 문서 수
-    k : int
-        RRF 상수 (기본 60)
-    per_retriever_k : int or None
-        각 리트리버에서 가져올 상위 문서 수.
-        None이면 size와 동일하게 사용.
+    per_retriever_k : int
+        각 리트리버에서 가져올 상위 문서 수 (기본 200)
     """
-    if per_retriever_k is None:
-        # 검색 풀을 넓게 가져왔다가 RRF로 재정렬
-        per_retriever_k = max(size, 50)
+    # 1) 쿼리 임베딩 계산
+    query_embedding = get_embedding([query_str])[0]
+    q = np.array(query_embedding, dtype="float32")
+    q_norm = np.linalg.norm(q)
+    if q_norm == 0:
+        q_norm = 1.0
+    q = q / q_norm  # 코사인 유사도 계산을 위한 정규화
 
-    # 1) 개별 리트리버 실행
+    # 2) 개별 리트리버 실행 (dense 200, sparse 200)
     sparse = sparse_retrieve(query_str, per_retriever_k)
     dense = dense_retrieve(query_str, per_retriever_k)
 
     sparse_hits = sparse.get("hits", {}).get("hits", [])
     dense_hits = dense.get("hits", {}).get("hits", [])
 
-    # 2) RRF 점수 계산
-    fused = rrf_fusion([sparse_hits, dense_hits], k=k)
+    # 3) docid 기준으로 합집합 (중복 제거)
+    candidates = {}  # docid -> _source
+    for hits in [sparse_hits, dense_hits]:
+        for h in hits:
+            src = h.get("_source", {})
+            docid = src.get("docid")
+            if docid is None:
+                continue
+            if docid not in candidates:
+                candidates[docid] = src
 
-    # 3) 점수 순으로 정렬 후 상위 size개 선택
-    merged_hits = sorted(
-        [
-            {"_source": v["_source"], "_score": v["_score"]}
-            for v in fused.values()
-        ],
-        key=lambda x: x["_score"],
-        reverse=True,
-    )[:size]
+    # 4) dense 임베딩 기준으로 재랭킹
+    scored_hits = []
+    for docid, src in candidates.items():
+        emb_list = src.get("embeddings")
+        if emb_list is None:
+            # embeddings가 없다면 재랭킹에 사용할 수 없으므로 스킵
+            continue
+        emb = np.array(emb_list, dtype="float32")
+        d_norm = np.linalg.norm(emb)
+        if d_norm == 0:
+            d_norm = 1.0
+        emb = emb / d_norm
+        score = float(np.dot(q, emb))  # 코사인 유사도
 
-    # 4) 기존 sparse_retrieve / hybrid_retrieve와 동일한 형식으로 반환
-    return {"hits": {"hits": merged_hits}}
+        scored_hits.append({
+            "_source": src,
+            "_score": score,
+        })
+
+    # 5) 점수 순으로 정렬 후 상위 size개 선택
+    scored_hits.sort(key=lambda x: x["_score"], reverse=True)
+    top_hits = scored_hits[:size]
+
+    return {"hits": {"hits": top_hits}}
 
 
 # -------------------------------
@@ -317,7 +303,7 @@ print(ret)
 # -------------------------------
 # 8. RAG 구현
 # -------------------------------
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY # type: ignore
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # type: ignore
 client = OpenAI(
     timeout=10
 )
@@ -430,6 +416,7 @@ def safe_chat_completion(
             print(f"[INFO] {sleep_sec}초 대기 후 재시도...")
             time.sleep(sleep_sec)
 
+
 def answer_question(messages):
     response = {"standalone_query": "", "topk": [], "references": [], "answer": ""}
 
@@ -453,12 +440,16 @@ def answer_question(messages):
 
     if result.choices[0].message.tool_calls:
         tool_call = result.choices[0].message.tool_calls[0]
-        function_args = json.loads(tool_call.function.arguments) # type: ignore
+        function_args = json.loads(tool_call.function.arguments)  # type: ignore
         standalone_query = function_args.get("standalone_query")
 
-        # RRF 기반 하이브리드 리트리버 사용
-        search_result = hybrid_retrieve_rrf(standalone_query, 3, k=60)
-        # search_result = hybrid_retrieve(standalone_query, 3, alpha=0.5)
+        # [변경] RRF 기반 하이브리드 리트리버 → dense 재랭킹 하이브리드로 교체
+        search_result = hybrid_retrieve_dense_rerank(
+            standalone_query,
+            size=3,
+            per_retriever_k=200
+        )
+
         response["standalone_query"] = standalone_query
 
         documents = search_result["hits"]["hits"]
