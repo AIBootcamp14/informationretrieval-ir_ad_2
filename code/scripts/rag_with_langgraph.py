@@ -33,6 +33,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--topk", dest="topk", type=int, default=3)
     parser.add_argument("--alpha", dest="alpha", type=float, default=0.5)
     parser.add_argument("--skip-index", dest="skip_index", action="store_true")
+
+    # 새 옵션: LLM 기반 rerank 사용 여부
+    parser.add_argument(
+        "--use-llm-rerank",
+        dest="use_llm_rerank",
+        action="store_true",
+        help="hybrid 검색 결과에 대해 LLM 기반 rerank를 적용합니다.",
+    )
+    parser.add_argument(
+        "--rerank-topn",
+        dest="rerank_topn",
+        type=int,
+        default=None,
+        help="LLM rerank 대상으로 사용할 상위 문서 수 (기본: --topk 값)",
+    )
+
     return parser
 
 
@@ -136,7 +152,14 @@ def main():
     callbacks = build_callbacks(deps)
     graph = build_rag_graph(callbacks)
 
-    retrieval_kwargs = {"size": args.topk, "alpha": args.alpha}
+    retrieval_kwargs: Dict[str, object] = {
+        "size": args.topk,
+        "alpha": args.alpha,
+        "use_llm_rerank": args.use_llm_rerank,
+    }
+    if args.rerank_topn is not None:
+        retrieval_kwargs["rerank_topn"] = args.rerank_topn
+
     stats = run_graph_on_eval(
         graph,
         eval_path=args.eval_path,
